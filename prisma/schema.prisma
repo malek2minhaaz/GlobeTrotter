@@ -1,0 +1,269 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// GlobeTrotter — Prisma schema
+//
+// Conventions used throughout:
+//   • IDs are cuid strings: they are safe to expose in URLs (no enumeration) and
+//     let the API generate records without a round-trip.
+//   • Date-only values use @db.Date so travelling across timezones can never
+//     shift a trip a day earlier or later. Stored at UTC midnight.
+//   • Clock times are "HH:mm" strings. Trips are local-time concepts; storing a
+//     full timestamp would invent a timezone the user never chose.
+//   • Money uses Decimal(12,2) to avoid float rounding in totals.
+//   • Reordering columns (`order`) deliberately have NO unique constraint: a swap
+//     of two rows is momentarily a duplicate, which would abort the transaction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum ActivityCategory {
+  ADVENTURE
+  SIGHTSEEING
+  FOOD
+  CULTURE
+  SHOPPING
+  NATURE
+  ENTERTAINMENT
+  RELAXATION
+}
+
+enum ExpenseCategory {
+  TRANSPORT
+  ACCOMMODATION
+  ACTIVITIES
+  MEALS
+  MISCELLANEOUS
+}
+
+// ── Identity ─────────────────────────────────────────────────────────────────
+
+model User {
+  id           String  @id @default(cuid())
+  name         String
+  email        String  @unique
+  passwordHash String
+  avatar       String?
+  language     String  @default("en")
+  currency     String  @default("INR")
+  role         Role    @default(USER)
+
+  // Preferences (Section 23 — Settings)
+  theme                    String  @default("system")
+  tripsPublicByDefault     Boolean @default(false)
+  notifyUpcomingTrips      Boolean @default(true)
+  notifyBudgetAlerts       Boolean @default(true)
+  notifyItineraryConflicts Boolean @default(true)
+
+  // Soft-delete marker. A deleted account is anonymised rather than hard-deleted
+  // so that public itineraries other travellers copied keep working.
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trips               Trip[]
+  savedDestinations   SavedDestination[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([createdAt])
+  @@index([role])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  // Only the hash is stored: a database leak must not hand over live reset links.
+  tokenHash String    @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ── Trip planning ────────────────────────────────────────────────────────────
+
+model Trip {
+  id          String  @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  coverImage  String?
+
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+
+  // Sharing (Section 20). publicSlug is null until the owner shares the trip.
+  isPublic   Boolean @default(false)
+  publicSlug String? @unique
+  viewCount  Int     @default(0)
+
+  // Optional spending ceiling that powers the over-budget alert (Section 18).
+  budgetLimit Decimal? @db.Decimal(12, 2)
+
+  // Provenance for "Copy Trip" (Section 21). SetNull keeps the copy alive even if
+  // the original itinerary is deleted.
+  sourceTripId String?
+  sourceTrip   Trip?   @relation("TripCopies", fields: [sourceTripId], references: [id], onDelete: SetNull)
+  copies       Trip[]  @relation("TripCopies")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stops          TripStop[]
+  expenses       Expense[]
+  itineraryItems ItineraryItem[]
+
+  @@index([userId, startDate])
+  @@index([isPublic])
+  @@index([sourceTripId])
+}
+
+model City {
+  id          String @id @default(cuid())
+  name        String
+  country     String
+  region      String
+  description String
+  image       String
+  // Relative daily cost of staying here (1.0 ≈ national average).
+  costIndex   Float  @default(1)
+  popularity  Int    @default(0)
+  latitude    Float
+  longitude   Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stops      TripStop[]
+  activities Activity[]
+  savedBy    SavedDestination[]
+
+  @@unique([name, country])
+  @@index([country])
+  @@index([region])
+  @@index([popularity])
+}
+
+model TripStop {
+  id     String @id @default(cuid())
+  tripId String
+  cityId String
+  order  Int
+
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trip           Trip            @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  city           City            @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  itineraryItems ItineraryItem[]
+
+  @@index([tripId, order])
+  @@index([cityId])
+}
+
+model Activity {
+  id            String           @id @default(cuid())
+  cityId        String
+  name          String
+  description   String
+  category      ActivityCategory
+  image         String
+  // Duration in hours; supports half-hour granularity (1.5).
+  duration      Float            @default(2)
+  estimatedCost Decimal          @db.Decimal(12, 2)
+  latitude      Float?
+  longitude     Float?
+  popularity    Int              @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  city           City            @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  itineraryItems ItineraryItem[]
+
+  @@index([cityId, category])
+  @@index([category])
+  @@index([popularity])
+}
+
+model ItineraryItem {
+  id         String  @id @default(cuid())
+  tripStopId String
+  tripId     String
+  // Null for free-form entries such as "Breakfast" or "Hotel check-in" that are
+  // not part of the curated activity catalogue.
+  activityId String?
+
+  title      String
+  category   ActivityCategory?
+  date       DateTime          @db.Date
+  startTime  String
+  endTime    String?
+  notes      String?
+  order      Int               @default(0)
+  // Overrides Activity.estimatedCost when the traveller pays a different price.
+  customCost Decimal?          @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tripStop TripStop  @relation(fields: [tripStopId], references: [id], onDelete: Cascade)
+  trip     Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  activity Activity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+
+  @@index([tripStopId, date, order])
+  @@index([tripId, date])
+  @@index([activityId])
+}
+
+model Expense {
+  id          String          @id @default(cuid())
+  tripId      String
+  category    ExpenseCategory
+  amount      Decimal         @db.Decimal(12, 2)
+  description String
+  date        DateTime        @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  @@index([tripId, date])
+  @@index([tripId, category])
+}
+
+model SavedDestination {
+  id        String   @id @default(cuid())
+  userId    String
+  cityId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  city City @relation(fields: [cityId], references: [id], onDelete: Cascade)
+
+  // A city can only be bookmarked once per traveller.
+  @@unique([userId, cityId])
+  @@index([userId])
+}
